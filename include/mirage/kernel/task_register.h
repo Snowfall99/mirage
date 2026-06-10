@@ -45,6 +45,8 @@ public:
                            bool with_residual);
   int register_silu_mul_task(threadblock::Graph const &bgraph,
                              std::vector<int> const &params);
+  int register_gelu_mul_task(threadblock::Graph const &bgraph,
+                             std::vector<int> const &params);
   int register_identity_task(threadblock::Graph const &bgraph,
                              std::vector<int> const &params);
   int register_silu_mul_linear_with_residual_task(
@@ -77,6 +79,8 @@ public:
                                           bool with_residual);
   int register_silu_mul_hopper_task(threadblock::Graph const &bgraph,
                                     std::vector<int> const &params);
+  int register_gelu_mul_hopper_task(threadblock::Graph const &bgraph,
+                                    std::vector<int> const &params);
   int register_embedding_hopper_task(threadblock::Graph const &bgraph,
                                      std::vector<int> const &params);
   int register_moe_linear_sm90_task(threadblock::Graph const &bgraph,
@@ -97,6 +101,8 @@ public:
                                  bool with_residual);
   int register_paged_attention_sm100_task(threadblock::Graph const &bgraph,
                                           std::vector<int> const &params);
+  int register_gemma4_paged_attention_sm100_task(
+      threadblock::Graph const &bgraph, std::vector<int> const &params);
   int register_argmax_partial_sm100_task(threadblock::Graph const &bgraph,
                                          std::vector<int> const &params);
   int register_argmax_reduce_sm100_task(threadblock::Graph const &bgraph,

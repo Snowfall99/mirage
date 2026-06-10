@@ -47,7 +47,24 @@ template <typename T,
           // The default 8 does NOT fit smem (MMA_ITERS_M 3->4, S_O_BUFFER
           // +32KB); to run Eagle3 (K<=5, mbt<=6) override it to 6. See the demo
           // header.
-          int MAX_TOKENS = 8>
+          int MAX_TOKENS = 8,
+          // SLIDING_WINDOW > 0 restricts each query token to the last
+          // SLIDING_WINDOW key positions (Gemma 4 local layers). 0 = full
+          // causal attention.
+          int SLIDING_WINDOW = 0,
+          // K_EQ_V: the packed QKV tensor has no V section; V is derived from
+          // the K projection (Gemma 4 global layers, attention_k_eq_v). K and
+          // V caches still differ: K is k_norm-ed + roped, V is v_norm-ed.
+          bool K_EQ_V = false,
+          // V_NORM: apply an unweighted RMS norm to new V tokens before they
+          // are used/cached (Gemma 4 v_norm, with_scale=False).
+          bool V_NORM = false,
+          // UNIT_SM_SCALE: softmax scale 1.0 instead of 1/sqrt(HEAD_DIM)
+          // (Gemma 4 uses scaling=1.0; its q_norm bounds logit magnitude).
+          bool UNIT_SM_SCALE = false,
+          // KV tile rows held in smem per pipeline stage. Lower it for large
+          // HEAD_DIM so the four K/V tile buffers fit in shared memory.
+          int KV_TILE_SIZE_IN = 64>
 __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     void const *qkv_ptr,
     void *paged_k_cache_ptr,
@@ -81,12 +98,13 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     // [max_num_pages, page_size, num_kv_heads, head_dim]
 
     constexpr int CP_CHUNK_SIZE = 16 / sizeof(T);
-    constexpr int KV_TILE_SIZE = 64;
+    constexpr int KV_TILE_SIZE = KV_TILE_SIZE_IN;
     // NOTE(Jinchen): we use m16n16k16 mma to compute matrix multiplication
     constexpr int MMA_ITERS_M = (MAX_TOKENS * NUM_QO_PER_KV + 15) / 16;
 
     // the scale factor for normalization in softmax
-    float const sm_scale = 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
+    float const sm_scale =
+        UNIT_SM_SCALE ? 1.0f : 1.0f / sqrtf(static_cast<float>(HEAD_DIM));
 
     int warp_idx = warp_id();
     int lane_idx = lane_id();
@@ -120,7 +138,10 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     T const *__restrict__ d_q =
         reinterpret_cast<T const *>(qkv_ptr) + first_token_pos * QKV_STRIDE;
     T const *__restrict__ d_k = d_q + NUM_QO_PER_KV * HEAD_DIM;
-    T const *__restrict__ d_v = d_k + HEAD_DIM;
+    // With K_EQ_V the packed tensor is [Q..., K] with no V section: V starts
+    // from the same projection as K (it then gets v_norm instead of
+    // k_norm+rope below).
+    T const *__restrict__ d_v = K_EQ_V ? d_k : d_k + HEAD_DIM;
     T *__restrict__ d_paged_k_cache = reinterpret_cast<T *>(paged_k_cache_ptr);
     T *__restrict__ d_paged_v_cache = reinterpret_cast<T *>(paged_v_cache_ptr);
     T *__restrict__ d_output =
@@ -216,9 +237,20 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     KVSmem k_smem(s_k), v_smem(s_v);
     KVSmem k_buffer_smem(s_k_buffer), v_buffer_smem(s_v_buffer);
 
-    int const num_iters = (seq_len + KV_TILE_SIZE - 1) / KV_TILE_SIZE;
-    int curr_iter_len = min(seq_len, KV_TILE_SIZE);
-    int cp_finished_seq_len = 0;
+    // With a sliding window, KV tiles strictly older than what the oldest
+    // query token can see are skipped entirely. kv_window_start is the
+    // (tile-aligned) first KV position loaded; new tokens always fall in the
+    // processed range, so the KV-cache append below is unaffected.
+    int kv_window_start = 0;
+    if (SLIDING_WINDOW > 0) {
+      kv_window_start =
+          max(seq_len - num_tokens - SLIDING_WINDOW + 1, 0) / KV_TILE_SIZE *
+          KV_TILE_SIZE;
+    }
+    int const num_iters =
+        (seq_len - kv_window_start + KV_TILE_SIZE - 1) / KV_TILE_SIZE;
+    int curr_iter_len = min(seq_len - kv_window_start, KV_TILE_SIZE);
+    int cp_finished_seq_len = kv_window_start;
     // assert no leafover to be handled when loading qkv
     static_assert(HEAD_DIM % CP_CHUNK_SIZE == 0);
 
@@ -238,7 +270,7 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
       load_smem(q_smem(dst_row, dst_col), q_dmem(src_row, src_col));
     }
 
-    int page_idx_0 = page_indices[0];
+    int page_idx_0 = page_indices[cp_finished_seq_len / PAGE_SIZE];
 #pragma unroll
     for (int chunk_idx = threadIdx.x;
          chunk_idx < curr_iter_len * HEAD_DIM / CP_CHUNK_SIZE;
@@ -340,51 +372,94 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
       }
       wg_barrier.arrive_and_wait();
 
-      int kv_tokens_to_process = min(
-          curr_iter_len,
-          max(iter * KV_TILE_SIZE + curr_iter_len - (seq_len - num_tokens), 0));
+      // absolute KV position where the current tile starts
+      int const tile_start = kv_window_start + iter * KV_TILE_SIZE;
+      int kv_tokens_to_process =
+          min(curr_iter_len,
+              max(tile_start + curr_iter_len - (seq_len - num_tokens), 0));
       int first_kv_token_to_process =
-          iter * KV_TILE_SIZE + curr_iter_len - kv_tokens_to_process;
+          tile_start + curr_iter_len - kv_tokens_to_process;
       if (qk_norm) {
         // Q norm
         if (iter == 0) {
-          rms_norm_sm100<T,
-                         QOSmem,
-                         NUM_QO_PER_KV,
-                         HEAD_DIM,
-                         CONSUMER_WARPGROUP_SYNC_BARRIER_ID,
-                         ROTARY_SYNC_BARRIER_ID>(
-              q_smem,
-              static_cast<T const *>(q_norm_weight_ptr),
-              s_q_norm_sum,
-              q_eps,
-              num_tokens /*window_size*/,
-              0 /*token_offset*/,
-              rope,
-              static_cast<T const *>(cos_ptr) +
-                  (seq_len - num_tokens) * HEAD_DIM,
-              static_cast<T const *>(sin_ptr) +
-                  (seq_len - num_tokens) * HEAD_DIM);
+          if constexpr (HEAD_DIM > NUM_THREADS) {
+            // rms_norm_sm100's fused rotary is unsafe past NUM_THREADS
+            // columns (read-after-write across strided passes); use the
+            // pair-owning variant instead
+            rms_norm_rope_pairwise_sm100<T,
+                                         QOSmem,
+                                         NUM_QO_PER_KV,
+                                         HEAD_DIM,
+                                         CONSUMER_WARPGROUP_SYNC_BARRIER_ID>(
+                q_smem,
+                static_cast<T const *>(q_norm_weight_ptr),
+                s_q_norm_sum,
+                q_eps,
+                num_tokens /*window_size*/,
+                0 /*token_offset*/,
+                rope,
+                static_cast<T const *>(cos_ptr) +
+                    (seq_len - num_tokens) * HEAD_DIM,
+                static_cast<T const *>(sin_ptr) +
+                    (seq_len - num_tokens) * HEAD_DIM);
+          } else {
+            rms_norm_sm100<T,
+                           QOSmem,
+                           NUM_QO_PER_KV,
+                           HEAD_DIM,
+                           CONSUMER_WARPGROUP_SYNC_BARRIER_ID,
+                           ROTARY_SYNC_BARRIER_ID>(
+                q_smem,
+                static_cast<T const *>(q_norm_weight_ptr),
+                s_q_norm_sum,
+                q_eps,
+                num_tokens /*window_size*/,
+                0 /*token_offset*/,
+                rope,
+                static_cast<T const *>(cos_ptr) +
+                    (seq_len - num_tokens) * HEAD_DIM,
+                static_cast<T const *>(sin_ptr) +
+                    (seq_len - num_tokens) * HEAD_DIM);
+          }
         }
         // K norm
         if (kv_tokens_to_process > 0) {
-          rms_norm_sm100<T,
-                         KVSmem,
-                         1,
-                         HEAD_DIM,
-                         CONSUMER_WARPGROUP_SYNC_BARRIER_ID,
-                         ROTARY_SYNC_BARRIER_ID>(
-              k_smem,
-              static_cast<T const *>(k_norm_weight_ptr),
-              s_k_norm_sum,
-              k_eps,
-              kv_tokens_to_process /*window_size*/,
-              curr_iter_len - kv_tokens_to_process,
-              rope,
-              static_cast<T const *>(cos_ptr) +
-                  first_kv_token_to_process * HEAD_DIM,
-              static_cast<T const *>(sin_ptr) +
-                  first_kv_token_to_process * HEAD_DIM);
+          if constexpr (HEAD_DIM > NUM_THREADS) {
+            rms_norm_rope_pairwise_sm100<T,
+                                         KVSmem,
+                                         1,
+                                         HEAD_DIM,
+                                         CONSUMER_WARPGROUP_SYNC_BARRIER_ID>(
+                k_smem,
+                static_cast<T const *>(k_norm_weight_ptr),
+                s_k_norm_sum,
+                k_eps,
+                kv_tokens_to_process /*window_size*/,
+                curr_iter_len - kv_tokens_to_process,
+                rope,
+                static_cast<T const *>(cos_ptr) +
+                    first_kv_token_to_process * HEAD_DIM,
+                static_cast<T const *>(sin_ptr) +
+                    first_kv_token_to_process * HEAD_DIM);
+          } else {
+            rms_norm_sm100<T,
+                           KVSmem,
+                           1,
+                           HEAD_DIM,
+                           CONSUMER_WARPGROUP_SYNC_BARRIER_ID,
+                           ROTARY_SYNC_BARRIER_ID>(
+                k_smem,
+                static_cast<T const *>(k_norm_weight_ptr),
+                s_k_norm_sum,
+                k_eps,
+                kv_tokens_to_process /*window_size*/,
+                curr_iter_len - kv_tokens_to_process,
+                rope,
+                static_cast<T const *>(cos_ptr) +
+                    first_kv_token_to_process * HEAD_DIM,
+                static_cast<T const *>(sin_ptr) +
+                    first_kv_token_to_process * HEAD_DIM);
+          }
         }
       } else if (rope) {
         if (iter == 0) {
@@ -425,6 +500,27 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
                 token_idx + curr_iter_len - kv_tokens_to_process);
           }
         }
+      }
+
+      // V norm (Gemma 4): unweighted RMS norm applied to the new V tokens
+      // before they are consumed by the PV matmul and appended to the cache.
+      // No rotary on V. v_smem holds its own copy of the data, so this is
+      // independent of the in-place K transform above (also when K_EQ_V).
+      if (V_NORM && kv_tokens_to_process > 0) {
+        rms_norm_rope_pairwise_sm100<T,
+                                     KVSmem,
+                                     1,
+                                     HEAD_DIM,
+                                     CONSUMER_WARPGROUP_SYNC_BARRIER_ID>(
+            v_smem,
+            static_cast<T const *>(nullptr),
+            s_k_norm_sum,
+            k_eps,
+            kv_tokens_to_process /*window_size*/,
+            curr_iter_len - kv_tokens_to_process,
+            false /*rotary_emd*/,
+            nullptr,
+            nullptr);
       }
 
       wg_barrier.arrive_and_wait();
@@ -508,9 +604,20 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
           int col = (warp_idx << 4) + ((lane_idx & 0x3) << 1) +
                     ((frag_idx >> 2) << 3) + (frag_idx & 0x1);
           int token_idx = row / NUM_QO_PER_KV;
-          bool is_valid =
-              (row < num_tokens * NUM_QO_PER_KV) &&
-              (col + iter * KV_TILE_SIZE <= token_idx + seq_len - num_tokens);
+          // query token token_idx sits at absolute position
+          // (token_idx + seq_len - num_tokens); causal upper bound, plus the
+          // sliding-window lower bound when enabled
+          int kv_pos = col + kv_window_start + iter * KV_TILE_SIZE;
+          // col < curr_iter_len: the warps cover 64 KV columns regardless of
+          // KV_TILE_SIZE; for KV_TILE_SIZE < 64 the surplus columns read the
+          // zero buffer and must be masked out here (with KV_TILE_SIZE == 64
+          // the causal bound already covers them)
+          bool is_valid = (row < num_tokens * NUM_QO_PER_KV) &&
+                          (col < curr_iter_len) &&
+                          (kv_pos <= token_idx + seq_len - num_tokens) &&
+                          (SLIDING_WINDOW <= 0 ||
+                           kv_pos + SLIDING_WINDOW >
+                               token_idx + seq_len - num_tokens);
           x_frag_f[m][frag_idx] = is_valid ? x_frag_f[m][frag_idx] : -inf;
           m_local[m][(frag_idx & 0x3) >> 1] =
               max(m_local[m][(frag_idx & 0x3) >> 1], x_frag_f[m][frag_idx]);
@@ -597,7 +704,16 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
       curr_iter_len = next_iter_len;
     }
 
-    // write intermediate results to buffer in shared memory
+    // write intermediate results to buffer in shared memory, then combine the
+    // four KV-splitting warps' partials. The o scratch buffer holds 64 floats
+    // per thread per MMA m-iter, i.e. 8 n-iters x 8 frags = 128 head-dim
+    // columns. HEAD_DIM > 128 is processed in column chunks of 128 so the
+    // buffer (and thus shared memory) does not grow with HEAD_DIM.
+    constexpr int N_ITERS_PER_CHUNK = HEAD_DIM / 16 < 8 ? HEAD_DIM / 16 : 8;
+    constexpr int COLS_PER_CHUNK = N_ITERS_PER_CHUNK * 16;
+    constexpr int N_CHUNKS = HEAD_DIM / COLS_PER_CHUNK;
+
+    // m/d are per-row scalars, independent of the column chunk: write once
 #pragma unroll
     for (int m = 0; m < MMA_ITERS_M; m++) {
       m_local[m][0] *= m_local[m][0] != -inf ? sm_scale : 1.f;
@@ -606,25 +722,33 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
       s_m_buffer[m * NUM_THREADS * 2 + threadIdx.x * 2 + 1] = m_local[m][1];
       s_d_buffer[m * NUM_THREADS * 2 + threadIdx.x * 2] = d[m][0];
       s_d_buffer[m * NUM_THREADS * 2 + threadIdx.x * 2 + 1] = d[m][1];
-      for (int n = 0; n < HEAD_DIM / 16; n++) {
+    }
+
 #pragma unroll
-        for (int frag_idx = 0; frag_idx < 8; frag_idx++) {
-          s_o_buffer[m * NUM_THREADS * 64 + threadIdx.x * 64 + n * 8 +
-                     frag_idx] = o[m][n][frag_idx];
+    for (int chunk = 0; chunk < N_CHUNKS; chunk++) {
+#pragma unroll
+      for (int m = 0; m < MMA_ITERS_M; m++) {
+#pragma unroll
+        for (int n_local = 0; n_local < N_ITERS_PER_CHUNK; n_local++) {
+#pragma unroll
+          for (int frag_idx = 0; frag_idx < 8; frag_idx++) {
+            s_o_buffer[m * NUM_THREADS * 64 + threadIdx.x * 64 + n_local * 8 +
+                       frag_idx] =
+                o[m][chunk * N_ITERS_PER_CHUNK + n_local][frag_idx];
+          }
         }
       }
-    }
-    wg_barrier.arrive_and_wait();
+      wg_barrier.arrive_and_wait();
 
-    // get global m, d, and o
-    // each thread handles an element in o in each iteration
-    for (int elem_idx = threadIdx.x;
-         elem_idx < num_tokens * NUM_QO_PER_KV * HEAD_DIM;
-         elem_idx += NUM_THREADS) {
-      int row = elem_idx / HEAD_DIM;
-      int col = elem_idx % HEAD_DIM;
-      int t_idx = (row % 8) * 4 + (col % 8) / 2;
-      int mma_iter_n = col / 16;
+      // get global m, d, and o for this column chunk
+      // each thread handles an element in o in each iteration
+      for (int elem_idx = threadIdx.x;
+           elem_idx < num_tokens * NUM_QO_PER_KV * COLS_PER_CHUNK;
+           elem_idx += NUM_THREADS) {
+        int row = elem_idx / COLS_PER_CHUNK;
+        int col = chunk * COLS_PER_CHUNK + elem_idx % COLS_PER_CHUNK;
+        int t_idx = (row % 8) * 4 + (col % 8) / 2;
+        int mma_iter_n = (elem_idx % COLS_PER_CHUNK) / 16;
       /* The fragment layout is as follows:
        *
        * 0 1 0 1 0 1 0 1 4 5 4 5 4 5 4 5
@@ -644,39 +768,43 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
        * 2 3 2 3 2 3 2 3 6 7 6 7 6 7 6 7
        * 2 3 2 3 2 3 2 3 6 7 6 7 6 7 6 7
        */
-      int frag_idx = ((col % 16) / 8) * 4 + ((row % 16) / 8) * 2 + (col % 2);
+        int frag_idx = ((col % 16) / 8) * 4 + ((row % 16) / 8) * 2 + (col % 2);
 
-      float m_global = -inf;
-      float d_global = 1.f;
-      float o_global = 0.f;
-      // 4 local values per row
+        float m_global = -inf;
+        float d_global = 1.f;
+        float o_global = 0.f;
+        // 4 local values per row
 #pragma unroll
-      for (int local_idx = 0; local_idx < 4; local_idx++) {
-        // access the shared memory buffer
-        int md_smem_offset = (row / 16) * NUM_THREADS * 2 // mma iter m
-                             + local_idx * 32 * 2  // 32 threads per local value
-                             + t_idx * 2           // corresponding thread
-                             + (frag_idx % 4) / 2; // first half or second half
-        float m_prev = m_global,
-              d_prev = d_global; // save previous values
-        float other_m = s_m_buffer[md_smem_offset],
-              other_d = s_d_buffer[md_smem_offset];
-        m_global = max(m_prev, other_m);
-        d_global = d_prev * expf(m_prev - m_global) +
-                   other_d * expf(other_m - m_global);
-        // accumulate o
-        float other_o =
-            s_o_buffer[(row / 16) * NUM_THREADS * 64 // mma iter m
-                       + local_idx * 32 * 64 // 32 threads per local value
-                       + t_idx * 64          // corresponding thread
-                       + mma_iter_n * 8      // mma iter n
-                       + frag_idx];
-        o_global = o_global * expf(m_prev - m_global) +
-                   other_o * expf(other_m - m_global);
+        for (int local_idx = 0; local_idx < 4; local_idx++) {
+          // access the shared memory buffer
+          int md_smem_offset =
+              (row / 16) * NUM_THREADS * 2  // mma iter m
+              + local_idx * 32 * 2          // 32 threads per local value
+              + t_idx * 2                   // corresponding thread
+              + (frag_idx % 4) / 2;         // first half or second half
+          float m_prev = m_global,
+                d_prev = d_global; // save previous values
+          float other_m = s_m_buffer[md_smem_offset],
+                other_d = s_d_buffer[md_smem_offset];
+          m_global = max(m_prev, other_m);
+          d_global = d_prev * expf(m_prev - m_global) +
+                     other_d * expf(other_m - m_global);
+          // accumulate o
+          float other_o =
+              s_o_buffer[(row / 16) * NUM_THREADS * 64 // mma iter m
+                         + local_idx * 32 * 64 // 32 threads per local value
+                         + t_idx * 64          // corresponding thread
+                         + mma_iter_n * 8      // mma iter n (within chunk)
+                         + frag_idx];
+          o_global = o_global * expf(m_prev - m_global) +
+                     other_o * expf(other_m - m_global);
+        }
+        o_smem.at(row, col) = bfloat16(o_global / d_global);
       }
-      o_smem.at(row, col) = bfloat16(o_global / d_global);
+      // all threads must be done reading s_o_buffer before the next chunk
+      // overwrites it
+      wg_barrier.arrive_and_wait();
     }
-    wg_barrier.arrive_and_wait();
 
     // store the output
     for (int elem_idx = threadIdx.x;

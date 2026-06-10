@@ -106,6 +106,7 @@ enum TaskType {
   TASK_RMS_NORM = 119,
   TASK_LINEAR = 120,
   TASK_IDENTITY = 121,
+  TASK_GELU_MUL = 122,
   // Hopper Tasks
   TASK_HOPPER_TASK_BEGIN = 150, // Hopper start placeholder, not a real task
   TASK_LINEAR_WITH_RESIDUAL_HOPPER = 151,
@@ -122,6 +123,7 @@ enum TaskType {
   TASK_MOE_W2_LINEAR_SM90 = 162,
   TASK_SPLITK_LINEAR_SWAPAB_HOPPER = 163,
   TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER = 164,
+  TASK_GELU_MUL_HOPPER = 165,
   TASK_HOPPER_TASK_END = 198, // Hopper end placeholder, not a real task
   // SM100 Tasks
   TASK_SM100_TASK_BEGIN = 230, // SM100 start placeholder, not a real task

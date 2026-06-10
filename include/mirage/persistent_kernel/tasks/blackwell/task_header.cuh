@@ -1,5 +1,6 @@
 // Ampere task impls
 #include "tasks/ampere/embedding.cuh"
+#include "tasks/ampere/gelu_mul.cuh"
 #include "tasks/ampere/merge_splitkv.cuh"
 #include "tasks/ampere/multitoken_paged_attention_split_kv.cuh"
 #include "tasks/ampere/silu_mul.cuh"
@@ -10,6 +11,7 @@
 #include "tasks/cute/hopper/gemm_ws.cuh"
 #include "tasks/cute/hopper/gemm_ws_cooperative.cuh"
 #include "tasks/cute/hopper/gemm_ws_mpk.cuh"
+#include "tasks/hopper/gelu_mul_hopper.cuh"
 #include "tasks/hopper/linear_hopper.cuh"
 #include "tasks/hopper/linear_swapAB_hopper.cuh"
 #include "tasks/hopper/multitoken_paged_attention_hopper.cuh"

@@ -1,6 +1,7 @@
 // Ampere task impls
 #include "tasks/ampere/argmax.cuh"
 #include "tasks/ampere/embedding.cuh"
+#include "tasks/ampere/gelu_mul.cuh"
 #include "tasks/ampere/merge_splitkv.cuh"
 #include "tasks/ampere/reduction.cuh"
 #include "tasks/ampere/silu_mul.cuh"
@@ -14,6 +15,7 @@
 #include "tasks/cute/hopper/gemm_ws_cooperative.cuh"
 #include "tasks/cute/hopper/gemm_ws_mpk.cuh"
 #include "tasks/hopper/embedding_hopper.cuh"
+#include "tasks/hopper/gelu_mul_hopper.cuh"
 #include "tasks/hopper/linear_hopper.cuh"
 #include "tasks/hopper/linear_swapAB_hopper.cuh"
 #include "tasks/hopper/moe_linear_swapAB_hopper.cuh"

@@ -1759,6 +1759,7 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_RMS_NORM_LINEAR] = "TASK_RMS_NORM_LINEAR";
   task_type_to_name[TASK_ATTENTION_1] = "TASK_ATTENTION_1";
   task_type_to_name[TASK_SILU_MUL] = "TASK_SILU_MUL";
+  task_type_to_name[TASK_GELU_MUL] = "TASK_GELU_MUL";
   task_type_to_name[TASK_IDENTITY] = "TASK_IDENTITY";
   task_type_to_name[TASK_SILU_MUL_LINEAR_WITH_RESIDUAL] =
       "TASK_SILU_MUL_LINEAR_WITH_RESIDUAL";
@@ -1786,6 +1787,7 @@ TaskGraphResult print_task_graph(
   task_type_to_name[TASK_LINEAR_CUTLASS_WITH_RESIDUAL_HOPPER] =
       "TASK_LINEAR_CUTLASS_WITH_RESIDUAL_HOPPER";
   task_type_to_name[TASK_SILU_MUL_HOPPER] = "TASK_SILU_MUL_HOPPER";
+  task_type_to_name[TASK_GELU_MUL_HOPPER] = "TASK_GELU_MUL_HOPPER";
   task_type_to_name[TASK_EMBEDDING_HOPPER] = "TASK_EMBEDDING_HOPPER";
   task_type_to_name[TASK_LINEAR_SM100] = "TASK_LINEAR_SM100";
   task_type_to_name[TASK_LINEAR_WITH_RESIDUAL_SM100] =

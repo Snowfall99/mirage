@@ -403,6 +403,51 @@ int TaskRegister::register_silu_mul_task(threadblock::Graph const &bgraph,
   return register_task_variant(TASK_SILU_MUL, code.to_string());
 }
 
+int TaskRegister::register_gelu_mul_task(threadblock::Graph const &bgraph,
+                                         std::vector<int> const &params) {
+  assert(params.size() == 0);
+  int batch_size = 0, output_size = 0, input_stride, output_stride;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 1;
+  int num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  batch_size = output_ops[0]->output_tensors[0].dim[0];
+  output_size = output_ops[0]->output_tensors[0].dim[1];
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(input_ops[0]->output_tensors[0].dim[1] == output_size * 2);
+  // get input stride
+  assert(input_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  input_stride = input_ops[0]->dtensor.dim[1];
+  assert(input_stride == static_cast<int>(kn_input_op->input_strides[0]));
+  // get output stride
+  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn_input_op = static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+  output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gelu_mul_task_impl<bfloat16, $, $, $, $>(",
+         batch_size,
+         output_size,
+         input_stride,
+         output_stride);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+  return register_task_variant(TASK_GELU_MUL, code.to_string());
+}
+
 int TaskRegister::register_identity_task(threadblock::Graph const &bgraph,
                                          std::vector<int> const &params) {
   assert(params.size() == 0);
@@ -1555,6 +1600,51 @@ int TaskRegister::register_silu_mul_hopper_task(
   return register_task_variant(TASK_SILU_MUL_HOPPER, code.to_string());
 }
 
+int TaskRegister::register_gelu_mul_hopper_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  assert(params.size() == 0);
+  int batch_size = 0, output_size = 0, input_stride, output_stride;
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 1;
+  int num_outputs = 1;
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  batch_size = output_ops[0]->output_tensors[0].dim[0];
+  output_size = output_ops[0]->output_tensors[0].dim[1];
+  assert(input_ops[0]->dtensor.num_dims == 2);
+  assert(input_ops[0]->output_tensors[0].dim[1] == output_size * 2);
+  // get input stride
+  assert(input_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn::KNInputOp *kn_input_op =
+      static_cast<kn::KNInputOp *>(input_ops[0]->dtensor.owner_op);
+  input_stride = input_ops[0]->dtensor.dim[1];
+  assert(input_stride == static_cast<int>(kn_input_op->input_strides[0]));
+  // get output stride
+  assert(output_ops[0]->dtensor.owner_op->op_type == type::KN_INPUT_OP);
+  kn_input_op = static_cast<kn::KNInputOp *>(output_ops[0]->dtensor.owner_op);
+  output_stride = static_cast<int>(kn_input_op->input_strides[0]);
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::gelu_mul_task_impl_hopper<bfloat16, $, $, $, $>(",
+         batch_size,
+         output_size,
+         input_stride,
+         output_stride);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    runtime_config.qo_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS]);");
+  return register_task_variant(TASK_GELU_MUL_HOPPER, code.to_string());
+}
+
 int TaskRegister::register_embedding_hopper_task(
     threadblock::Graph const &bgraph, std::vector<int> const &params) {
   assert(params.size() == 1);
@@ -1974,6 +2064,104 @@ int TaskRegister::register_paged_attention_sm100_task(
   code.e("    task_desc->task_metadata.request_id,");
   code.e("    $,", params[2] > 0);
   code.e("    $,", params[3] > 0);
+  code.e("    task_desc->input_ptrs[3],");
+  code.e("    task_desc->input_ptrs[4],");
+  code.e("    task_desc->input_ptrs[5],");
+  code.e("    task_desc->input_ptrs[6],");
+  code.e("    1e-6f,");
+  code.e("    1e-6f);");
+  return register_task_variant(TASK_ATTN_SM100, code.to_string());
+}
+
+// Gemma 4 attention variant. Covers both layer kinds:
+//  - sliding layers: SLIDING_WINDOW > 0, one task per KV head
+//  - global layers: K=V (packed tensor is [Q..., K] with K replicated per
+//    Q-head group so the threadblock partition stays self-describing),
+//    one task per group of num_q_heads / q_split query heads
+// Always: unweighted v_norm on new V tokens, softmax scale 1.0.
+int TaskRegister::register_gemma4_paged_attention_sm100_task(
+    threadblock::Graph const &bgraph, std::vector<int> const &params) {
+  // params[0]: num_q_heads (whole layer)
+  // params[1]: num_kv_heads (whole layer)
+  // params[2]: q_split (tasks per request = num_kv_heads * q_split)
+  // params[3]: qk_norm
+  // params[4]: rotary_embed
+  // params[5]: max_seq_len
+  // params[6]: page_size
+  // params[7]: sliding_window (0 = full attention)
+  // params[8]: k_eq_v (1 = no V section in the packed QKV tensor)
+  // params[9]: kv_tile_size (smem rows per pipeline stage)
+  assert(params.size() == 10);
+  std::vector<tb::TBInputOp *> input_ops;
+  std::vector<tb::TBInputOp *> output_ops;
+  int num_inputs = 7;
+  int num_outputs = 1;
+
+  assert(bgraph.operators.size() == (size_t)num_inputs + num_outputs);
+  for (auto const &op : bgraph.operators) {
+    assert(op->op_type == mirage::type::TB_INPUT_OP);
+    if (input_ops.size() < (size_t)num_inputs) {
+      input_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    } else {
+      output_ops.push_back(static_cast<tb::TBInputOp *>(op));
+    }
+  }
+  assert(output_ops[0]->output_tensors[0].num_dims == 2);
+  int max_tokens = input_ops[0]->dtensor.dim[0];
+  int qkv_stride = input_ops[0]->dtensor.dim[1];
+  int output_size = output_ops[0]->dtensor.dim[1];
+  int num_q_heads = params[0];
+  int num_kv_heads = params[1];
+  int q_split = params[2];
+  int max_seq_len = params[5];
+  int page_size = params[6];
+  int sliding_window = params[7];
+  int k_eq_v = params[8];
+  int kv_tile_size = params[9];
+  int head_dim = output_size / num_q_heads;
+  int kv_stride = head_dim * num_kv_heads;
+  assert(num_q_heads % (num_kv_heads * q_split) == 0);
+  int num_qo_per_task = num_q_heads / (num_kv_heads * q_split);
+  // K=V layers carry no V section; the single KV head is replicated per task
+  // chunk, so each chunk is [num_qo_per_task * head_dim | head_dim]
+  assert(k_eq_v ? num_kv_heads == 1 : q_split == 1);
+  assert(page_size % kv_tile_size == 0);
+  // Assert that k_cache has the same head_dim
+  assert(input_ops[1]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[1]->output_tensors[0].dim[3]);
+  assert(input_ops[2]->output_tensors[0].num_dims == 4);
+  assert(head_dim == input_ops[2]->output_tensors[0].dim[3]);
+
+  mirage::transpiler::CodeKeeper code;
+  code.inc_indent();
+  code.e("kernel::multitoken_paged_attention_sm100_task_impl<bfloat16, "
+         "$, $, $, $, $, $, $, $, "
+         "/*Q_LEN_OVERRIDE*/ 0, /*TAIL_OFFSET*/ 0, "
+         "/*MAX_TOKENS*/ $, /*SLIDING_WINDOW*/ $, /*K_EQ_V*/ $, "
+         "/*V_NORM*/ true, /*UNIT_SM_SCALE*/ true, /*KV_TILE_SIZE*/ $>(",
+         num_qo_per_task,
+         1,
+         kv_stride,
+         qkv_stride,
+         output_size,
+         head_dim,
+         max_seq_len,
+         page_size,
+         max_tokens,
+         sliding_window,
+         k_eq_v != 0,
+         kv_tile_size);
+  code.e("    task_desc->input_ptrs[0],");
+  code.e("    task_desc->input_ptrs[1],");
+  code.e("    task_desc->input_ptrs[2],");
+  code.e("    task_desc->output_ptrs[0],");
+  code.e("    runtime_config.qo_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indptr_buffer,");
+  code.e("    runtime_config.paged_kv_indices_buffer,");
+  code.e("    runtime_config.paged_kv_last_page_len_buffer,");
+  code.e("    task_desc->task_metadata.request_id,");
+  code.e("    $,", params[3] > 0);
+  code.e("    $,", params[4] > 0);
   code.e("    task_desc->input_ptrs[3],");
   code.e("    task_desc->input_ptrs[4],");
   code.e("    task_desc->input_ptrs[5],");

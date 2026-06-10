@@ -98,7 +98,9 @@ __device__ __forceinline__ void rms_norm_sm100(InputSmem smem_input,
           int row = smem_seq_idx * NUM_HEAD + head_idx;
           int col = i;
           float val = (float)smem_input.at(row, col);
-          float w = (float)weight_ptr[i];
+          // weight_ptr == nullptr selects an unweighted RMS norm (Gemma 4's
+          // scale-free v_norm)
+          float w = weight_ptr ? (float)weight_ptr[i] : 1.0f;
           val *= rms_rcp * w;
           smem_input.at(row, col) = (T)val;
 
@@ -128,6 +130,92 @@ __device__ __forceinline__ void rms_norm_sm100(InputSmem smem_input,
         } // i
       }   // head_idx
     }     // win_idx
+  }
+}
+
+// Variant of rms_norm_sm100 that stays correct when HEAD_DIM > NUM_THREADS
+// and rotary is applied. rms_norm_sm100 strides columns by NUM_THREADS, so
+// with HEAD_DIM = 512 and 256 threads the second pass would read first-half
+// columns that were already rotated in the first pass. Here each thread owns
+// whole rotation pairs (i, i + HEAD_DIM/2), so reads and writes never cross
+// loop iterations. Used by the Gemma 4 global-attention path (head_dim 512).
+// weight_ptr == nullptr selects an unweighted RMS norm.
+template <typename T,
+          typename InputSmem,
+          int NUM_HEAD,
+          int HEAD_DIM,
+          int CONSUMER_WARPGROUP_SYNC_BARRIER_ID = 6>
+__device__ __forceinline__ void
+    rms_norm_rope_pairwise_sm100(InputSmem smem_input,
+                                 T const *weight_ptr,
+                                 float *reduce_smem,
+                                 float eps,
+                                 int window_size,
+                                 int token_offset = 0,
+                                 bool rotary_emd = false,
+                                 T const *cos_ptr = nullptr,
+                                 T const *sin_ptr = nullptr) {
+  static_assert(HEAD_DIM % 2 == 0);
+  cutlass::arch::NamedBarrier wg_barrier(
+      NUM_THREADS, /*bar-id*/ CONSUMER_WARPGROUP_SYNC_BARRIER_ID);
+  if (threadIdx.x < NUM_THREADS) {
+    int warp_idx = warp_id();
+    for (int win_idx = 0; win_idx < window_size; ++win_idx) {
+      int smem_seq_idx = token_offset + win_idx;
+      for (int head_idx = 0; head_idx < NUM_HEAD; ++head_idx) {
+        int row = smem_seq_idx * NUM_HEAD + head_idx;
+        float sum = 0.0f;
+#pragma unroll
+        for (uint32_t i = threadIdx.x; i < HEAD_DIM; i += NUM_THREADS) {
+          float val = (float)smem_input.at(row, (int)i);
+          sum += val * val;
+        }
+#pragma unroll
+        for (uint32_t offset = NUM_THREADS_PER_WARP / 2; offset > 0;
+             offset /= 2) {
+          sum += shfl_xor_sync(sum, offset);
+        }
+        if (threadIdx.x % 32 == 0) {
+          reduce_smem[warp_idx] = sum;
+        }
+        wg_barrier.arrive_and_wait();
+        sum = threadIdx.x < NUM_WARPS ? reduce_smem[threadIdx.x] : 0.0f;
+#pragma unroll
+        for (uint32_t offset = NUM_THREADS_PER_WARP / 2; offset > 0;
+             offset /= 2) {
+          sum += shfl_xor_sync(sum, offset);
+        }
+        if (threadIdx.x == 0) {
+          reduce_smem[0] = sum;
+        }
+        wg_barrier.arrive_and_wait();
+        float rms_rcp = rsqrt(reduce_smem[0] / float(HEAD_DIM) + eps);
+
+#pragma unroll
+        for (uint32_t i = threadIdx.x; i < HEAD_DIM / 2; i += NUM_THREADS) {
+          uint32_t j = i + HEAD_DIM / 2;
+          float v1 = (float)smem_input.at(row, (int)i) * rms_rcp *
+                     (weight_ptr ? (float)weight_ptr[i] : 1.0f);
+          float v2 = (float)smem_input.at(row, (int)j) * rms_rcp *
+                     (weight_ptr ? (float)weight_ptr[j] : 1.0f);
+          if (rotary_emd) {
+            T const *cur_cos_ptr = cos_ptr + win_idx * HEAD_DIM;
+            T const *cur_sin_ptr = sin_ptr + win_idx * HEAD_DIM;
+            // rotate_half pairing, identical to rms_norm_sm100: the cos/sin
+            // tables duplicate their halves (HF layout)
+            float r1 = v1 * (float)cur_cos_ptr[i] - v2 * (float)cur_sin_ptr[i];
+            float r2 = v2 * (float)cur_cos_ptr[j] + v1 * (float)cur_sin_ptr[j];
+            v1 = r1;
+            v2 = r2;
+          }
+          smem_input.at(row, (int)i) = (T)v1;
+          smem_input.at(row, (int)j) = (T)v2;
+        }
+        // ensure every thread is done with reduce_smem[0] before the next
+        // head/window iteration overwrites the reduction buffer
+        wg_barrier.arrive_and_wait();
+      } // head_idx
+    }   // win_idx
   }
 }
 } // namespace kernel

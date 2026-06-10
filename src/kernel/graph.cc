@@ -480,6 +480,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id =
         task_register->register_silu_mul_task(customized->bgraph, params);
     task_config[op] = std::make_tuple(1, 1, TASK_SILU_MUL, variant_id);
+  } else if (name == "gelu_mul") {
+    int variant_id =
+        task_register->register_gelu_mul_task(customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_GELU_MUL, variant_id);
   } else if (name == "identity") {
     int variant_id =
         task_register->register_identity_task(customized->bgraph, params);
@@ -561,6 +565,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
     int variant_id = task_register->register_silu_mul_hopper_task(
         customized->bgraph, params);
     task_config[op] = std::make_tuple(1, 1, TASK_SILU_MUL_HOPPER, variant_id);
+  } else if (name == "gelu_mul_hopper") {
+    int variant_id = task_register->register_gelu_mul_hopper_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(1, 1, TASK_GELU_MUL_HOPPER, variant_id);
   } else if (name == "embedding_hopper") {
     int variant_id = task_register->register_embedding_hopper_task(
         customized->bgraph, params);
@@ -604,6 +612,10 @@ void Graph::register_task(char const *task_type, std::vector<int> params) {
         std::make_tuple(3, 1, TASK_LINEAR_WITH_RESIDUAL_SM100, variant_id);
   } else if (name == "paged_attention_sm100") {
     int variant_id = task_register->register_paged_attention_sm100_task(
+        customized->bgraph, params);
+    task_config[op] = std::make_tuple(7, 1, TASK_ATTN_SM100, variant_id);
+  } else if (name == "gemma4_paged_attention_sm100") {
+    int variant_id = task_register->register_gemma4_paged_attention_sm100_task(
         customized->bgraph, params);
     task_config[op] = std::make_tuple(7, 1, TASK_ATTN_SM100, variant_id);
   } else if (name == "argmax_partial_sm100") {

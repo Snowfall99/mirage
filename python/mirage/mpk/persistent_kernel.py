@@ -911,7 +911,127 @@ class PersistentKernel:
         else:
             self.kn_graph.register_task(tb_graph, "paged_attention", params)
 
-    
+    def gemma4_paged_attention_layer(
+        self,
+        input: DTensor,
+        k_cache: DTensor,
+        v_cache: DTensor,
+        q_norm: DTensor,
+        k_norm: DTensor,
+        cos_pos_embed: DTensor,
+        sin_pos_embed: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+        sliding_window: int = 0,
+        k_eq_v: bool = False,
+        q_split: int = 1,
+        kv_tile_size: int = 32,
+        enable_qk_norm: bool = True,
+    ):
+        """Paged attention for Gemma 4 layers (Blackwell only).
+
+        Differences from paged_attention_layer:
+        - softmax scale is 1.0 (Gemma 4 `scaling=1.0`)
+        - new V tokens get an unweighted RMS norm (`v_norm`, with_scale=False)
+        - sliding_window > 0 restricts attention to the trailing window
+          (Gemma 4 sliding_attention layers)
+        - k_eq_v: the fused QKV tensor has no V section; V is derived from the
+          K projection (Gemma 4 full_attention layers, attention_k_eq_v). The
+          fused tensor must replicate K once per Q-head group:
+          [q-group 0, K, q-group 1, K, ...], with q_split groups.
+        - q_split: number of tasks the query heads are split into per KV head
+          (used by the global layers where a single 512-dim KV head serves all
+          16 query heads).
+        Partial rotary (Gemma 4 "proportional" RoPE, partial_rotary_factor
+        0.25) is expressed through the cos/sin tables: entries for unrotated
+        frequencies are cos=1/sin=0, so no extra kernel support is needed.
+        """
+        assert self.target_cc == 100, (
+            "gemma4_paged_attention_layer currently requires Blackwell "
+            "(target_cc == 100)")
+        assert input.num_dims == 2  # (num_tokens, fused_qkv_dim)
+        assert output.num_dims == 2  # (num_tokens, num_q_heads * head_dim)
+        assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
+        assert v_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
+        assert k_cache.dim(0) == self.max_num_pages
+        assert v_cache.dim(0) == self.max_num_pages
+        assert k_cache.dim(1) == self.page_size
+        assert v_cache.dim(1) == self.page_size
+        head_dim = k_cache.dim(3)
+        num_kv_heads = k_cache.dim(2)
+        num_q_heads = output.dim(1) // head_dim
+        assert num_q_heads % (num_kv_heads * q_split) == 0
+        num_qo_per_task = num_q_heads // (num_kv_heads * q_split)
+        if k_eq_v:
+            assert num_kv_heads == 1, "k_eq_v expects a single shared KV head"
+            # [q-group | K] per task chunk, K replicated q_split times
+            assert input.dim(1) == q_split * (num_qo_per_task + 1) * head_dim
+        else:
+            assert q_split == 1, "q_split > 1 is only used with k_eq_v"
+            assert input.dim(1) == num_kv_heads * (num_qo_per_task + 2) * head_dim
+        assert self.page_size % kv_tile_size == 0
+        rotary_embed = 0
+        if cos_pos_embed is not None or sin_pos_embed is not None:
+            assert cos_pos_embed.num_dims == 2  # (seq_len, head_dim)
+            assert sin_pos_embed.num_dims == 2  # (seq_len, head_dim)
+            assert cos_pos_embed.dim(1) == head_dim
+            assert sin_pos_embed.dim(1) == head_dim
+            rotary_embed = 1
+        assert q_norm is not None and k_norm is not None, (
+            "q_norm/k_norm must be valid DTensors; pass a dummy + "
+            "enable_qk_norm=False when norm is disabled")
+        assert q_norm.num_dims == 1  # (head_dim)
+        assert k_norm.num_dims == 1  # (head_dim)
+        assert q_norm.dim(0) == head_dim
+        assert k_norm.dim(0) == head_dim
+        qk_norm = 1 if enable_qk_norm else 0
+
+        params = [
+            num_q_heads,
+            num_kv_heads,
+            q_split,
+            qk_norm,
+            rotary_embed,
+            self.max_seq_length,
+            self.page_size,
+            sliding_window,
+            1 if k_eq_v else 0,
+            kv_tile_size,
+        ]
+
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        assert grid_dim[0] == self.max_num_batched_requests
+        assert grid_dim[1] == num_kv_heads * q_split
+        tb_graph.new_input(input, (-1, 1, -1), -1, True)
+        if k_eq_v:
+            # single shared KV head: every task sees the whole cache
+            tb_graph.new_input(k_cache, (-1, -1, -1), 1, True)
+            tb_graph.new_input(v_cache, (-1, -1, -1), 1, True)
+        else:
+            tb_graph.new_input(k_cache, (-1, 2, -1), 1, True)
+            tb_graph.new_input(v_cache, (-1, 2, -1), 1, True)
+        tb_graph.new_input(q_norm, (-1, -1, -1), -1, True)
+        tb_graph.new_input(k_norm, (-1, -1, -1), -1, True)
+        tb_graph.new_input(cos_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(sin_pos_embed, (-1, -1, -1), -1, True)
+        tb_graph.new_input(output, (-1, 1, -1), -1, True)
+        self.kn_graph.customized(
+            [
+                input,
+                k_cache,
+                v_cache,
+                q_norm,
+                k_norm,
+                cos_pos_embed,
+                sin_pos_embed,
+                output,
+            ],
+            tb_graph,
+        )
+        self.kn_graph.register_task(
+            tb_graph, "gemma4_paged_attention_sm100", params)
+
     def paged_attention_split_kv_layer(
         self,
         input: DTensor,
@@ -1888,6 +2008,22 @@ class PersistentKernel:
         tb_graph.new_input(output, (1, -1, -1), 1, True)
         self.kn_graph.customized([input, output], tb_graph)
         self.kn_graph.register_task(tb_graph, "silu_mul" if self.target_cc == 90 else "silu_mul")
+
+    def gelu_mul_layer(
+        self,
+        input: DTensor,
+        output: DTensor,
+        grid_dim: tuple,
+        block_dim: tuple,
+    ):
+        # Currently assume that input/output
+        assert input.num_dims == 2 # (batch_size, 2 * intermediate_size)
+        assert output.num_dims == 2 # (batch_size, intermediate_size)
+        tb_graph = TBGraph(CyTBGraph(grid_dim, block_dim, 1, 64))
+        tb_graph.new_input(input, (1, -1, -1), 1, True)
+        tb_graph.new_input(output, (1, -1, -1), 1, True)
+        self.kn_graph.customized([input, output], tb_graph)
+        self.kn_graph.register_task(tb_graph, "gelu_mul")
 
     def identity_layer(
         self,
