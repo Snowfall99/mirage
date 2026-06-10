@@ -18,6 +18,16 @@
 #include "allreduce.cuh"
 #endif
 
+// Consumer/workstation Blackwell (SM120, e.g. RTX Pro 6000) builds use the
+// ampere task set (-arch=native, 128-thread workers, no tcgen05/WGMMA) plus
+// the portable Blackwell tasks needed by Gemma 4: the extended paged
+// attention (sm_80-level mma/cp.async/named barriers only) and the
+// elementwise add used for sandwich-norm residuals.
+#if defined(MPK_TARGET_CC) && MPK_TARGET_CC >= 120
+#include "tasks/blackwell/attention_sm100.cuh"
+#include "tasks/blackwell/elementwise_add_sm100.cuh"
+#endif
+
 #if MIRAGE_USE_CUTLASS_KERNEL
 #include "linear_cutlass.cuh"
 #include "moe_linear.cuh"

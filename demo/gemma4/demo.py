@@ -233,7 +233,20 @@ if __name__ == "__main__":
 
     target_cc = (torch.cuda.get_device_properties(0).major * 10
                  + torch.cuda.get_device_properties(0).minor)
-    assert target_cc == 100, "the Gemma 4 attention tasks require SM100 (B200)"
+    assert target_cc in (100, 120), (
+        "the Gemma 4 attention tasks require Blackwell: SM100 (B200) or "
+        "SM120 (e.g. RTX Pro 6000)")
+    # KV tile sizes are bounded by per-block shared memory: B200 has ~201KB
+    # usable, consumer Blackwell ~96KB. On SM120 the head_dim-512 global
+    # layers additionally cap the per-task query rows at 2.
+    if target_cc == 120:
+        kv_tile_sliding, kv_tile_global = 16, 8
+        if args.max_num_batched_tokens > 2:
+            print("SM120: clamping max_num_batched_tokens to 2 "
+                  "(global-attention shared-memory budget)")
+            args.max_num_batched_tokens = 2
+    else:
+        kv_tile_sliding, kv_tile_global = 32, 16
 
     # ---- weight preparation -------------------------------------------------
     # embeddings are scaled by bf16(sqrt(hidden_size)) (HF downcasts the scale
@@ -352,10 +365,14 @@ if __name__ == "__main__":
     mlp_down_out = buf("mlp_down_out", hidden_size)
     post_ffn_norm_out = buf("post_ffn_norm_out", hidden_size)
     mlp_res_out = buf("mlp_res_out", hidden_size)
+    # fixed power-of-two task count for the vocab-wide lm_head/argmax split:
+    # vocab 262144 divides evenly by 128, whereas num_workers varies by GPU
+    # (e.g. 144 on RTX Pro 6000, which does not divide the vocab)
+    vocab_grid = 128
     argmax_in = buf("argmax_in", vocab_size)
-    argmax_part_value = buf("argmax_part_value", mpk.num_workers)
+    argmax_part_value = buf("argmax_part_value", vocab_grid)
     argmax_part_index = mpk.new_tensor(
-        dims=(mbt, mpk.num_workers), dtype=mi.int64,
+        dims=(mbt, vocab_grid), dtype=mi.int64,
         name="argmax_part_index", io_category="cuda_tensor")
     argmax_out = mpk.attach_input(torch_tensor=output_tokens, name="output_token")
 
@@ -431,7 +448,7 @@ if __name__ == "__main__":
                 grid_dim=(mpk.max_num_batched_requests, num_kv_heads, 1),
                 block_dim=(128, 1, 1),
                 sliding_window=sliding_window,
-                k_eq_v=False, q_split=1, kv_tile_size=32)
+                k_eq_v=False, q_split=1, kv_tile_size=kv_tile_sliding)
         else:
             mpk.gemma4_paged_attention_layer(
                 input=attn_in, k_cache=k_cache, v_cache=v_cache,
@@ -441,7 +458,7 @@ if __name__ == "__main__":
                 grid_dim=(mpk.max_num_batched_requests, q_split, 1),
                 block_dim=(128, 1, 1),
                 sliding_window=0,
-                k_eq_v=True, q_split=q_split, kv_tile_size=16)
+                k_eq_v=True, q_split=q_split, kv_tile_size=kv_tile_global)
 
         # o_proj (no fused residual: Gemma adds the residual after the
         # post-attention norm)
@@ -512,10 +529,10 @@ if __name__ == "__main__":
     mpk.rmsnorm_layer(input=x, weight=w_norm, output=rmsnorm_out,
                       grid_dim=(mbt, 1, 1), block_dim=(128, 1, 1))
     mpk.linear_layer(input=rmsnorm_out, weight=w_lm_head, output=argmax_in,
-                     grid_dim=(mpk.num_workers, 1, 1), block_dim=(128, 1, 1))
+                     grid_dim=(vocab_grid, 1, 1), block_dim=(128, 1, 1))
     mpk.argmax_partial_layer(
         input=argmax_in, output=(argmax_part_value, argmax_part_index),
-        grid_dim=(mpk.num_workers, 1, 1), block_dim=(128, 1, 1))
+        grid_dim=(vocab_grid, 1, 1), block_dim=(128, 1, 1))
     mpk.argmax_reduce_layer(
         input=(argmax_part_value, argmax_part_index), output=argmax_out,
         grid_dim=(1, 1, 1), block_dim=(128, 1, 1))

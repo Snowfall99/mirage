@@ -1,4 +1,4 @@
-# Gemma 4 on MPK (Blackwell / SM100)
+# Gemma 4 on MPK (Blackwell: SM100 and SM120)
 
 First-pass integration of `google/gemma-4-12B` (the "unified" encoder-free
 variant, text path only). Written and reviewed offline — **not yet compiled or
@@ -7,12 +7,39 @@ run on a GPU**; see "Verification status" below.
 ## Usage
 
 ```bash
-# MPK megakernel path (requires B200 / SM100)
+# MPK megakernel path (B200/SM100, or RTX Pro 6000 / consumer Blackwell SM120)
 python demo.py --use-mirage
 
 # PyTorch reference (requires transformers >= the version with gemma4 support)
 python demo.py
 ```
+
+## SM120 (RTX Pro 6000) support
+
+SM120 is consumer/workstation Blackwell: ~99KB shared memory per block (vs
+~227KB on B200), no tcgen05/TMEM, no WGMMA. MPK previously had no SM120 path
+at all (`linear_layer` asserted "Unsupported compute capability"). What makes
+it work now:
+
+- `runtime_header.h`: a `MPK_TARGET_CC >= 120` rung in the shared-memory
+  ladder (99KB) — previously SM120 matched the `>= 90` branch and would have
+  requested 207KB.
+- SM120 builds use the **ampere task set** (`-arch=native`, 128-thread
+  workers, CUTLASS sm_80 GEMMs) plus the portable Blackwell tasks Gemma needs:
+  the extended paged attention and `elementwise_add_sm100`, included from
+  `tasks/ampere/task_header.cuh` under `MPK_TARGET_CC >= 120`. The attention
+  kernel uses only sm_80-level primitives (cp.async, ldsm, mma.m16n16k16,
+  named barriers), so it compiles for SM120 directly.
+- Python dispatch routes cc 120 to ampere kernels for linear / rmsnorm
+  (previously cc>=90 incorrectly picked `rmsnorm_hopper`), and
+  `hopper/utils.cuh:wg_sync` no longer compiles to a `brkpt` trap on SM120.
+- Tighter smem budget: the demo picks `kv_tile_size` 16 (sliding) / 8
+  (global) and clamps `max_num_batched_tokens` to 2 on SM120.
+- The lm_head/argmax split uses a fixed grid of 128 tasks (divides vocab
+  262144) instead of `num_workers`, which is 144 on RTX Pro 6000 and does
+  not divide the vocab.
+
+Requires CUDA 12.8+ (for sm_120 in `-arch=native`).
 
 ## What was added for Gemma 4
 
@@ -52,10 +79,11 @@ python demo.py
 
 ## Known limitations
 
-- SM100 only (the task asserts `target_cc == 100`).
-- `max_num_batched_tokens <= 4`: the head_dim-512 global task's shared-memory
-  layout (Q/O staging + 64-float-per-thread reduction buffer) caps per-task
-  query rows.
+- Blackwell only (the task asserts `target_cc in (100, 120)`); no Hopper or
+  Ampere attention path yet.
+- `max_num_batched_tokens <= 4` on SM100 and `<= 2` on SM120: the
+  head_dim-512 global task's shared-memory layout (Q/O staging +
+  64-float-per-thread reduction buffer) caps per-task query rows.
 - Global-attention tasks hold ~256 accumulator floats per thread
   (`o[1][32][8]`) — expect register spills; correctness-first, optimize later.
 - `num_kv_shared_layers > 0` (trailing layers reusing earlier KV states, used

@@ -663,7 +663,10 @@ class PersistentKernel:
         tb_graph.new_input(weight, (-1, -1, -1), 0, True)
         tb_graph.new_input(output, (0, -1, -1), 1, True)
         self.kn_graph.customized([input, weight, output], tb_graph)
-        self.kn_graph.register_task(tb_graph, "rmsnorm_hopper" if self.target_cc >= 90 else "rmsnorm")
+        # SM120 (consumer Blackwell) uses the ampere task set
+        self.kn_graph.register_task(
+            tb_graph,
+            "rmsnorm_hopper" if 90 <= self.target_cc < 120 else "rmsnorm")
 
     def rmsnorm_linear_layer(
         self,
@@ -946,10 +949,16 @@ class PersistentKernel:
         Partial rotary (Gemma 4 "proportional" RoPE, partial_rotary_factor
         0.25) is expressed through the cos/sin tables: entries for unrotated
         frequencies are cos=1/sin=0, so no extra kernel support is needed.
+
+        Supported on SM100 (B200) and SM120 (consumer Blackwell, e.g. RTX Pro
+        6000); the kernel uses only sm_80-level primitives. SM120 has a ~99KB
+        shared-memory budget, so use smaller kv_tile_size there (16 for the
+        sliding layers, 8 for the head_dim-512 global layers) and
+        max_num_batched_tokens <= 2 for the global layers.
         """
-        assert self.target_cc == 100, (
-            "gemma4_paged_attention_layer currently requires Blackwell "
-            "(target_cc == 100)")
+        assert self.target_cc in (100, 120), (
+            "gemma4_paged_attention_layer requires Blackwell "
+            "(target_cc == 100 or 120)")
         assert input.num_dims == 2  # (num_tokens, fused_qkv_dim)
         assert output.num_dims == 2  # (num_tokens, num_q_heads * head_dim)
         assert k_cache.num_dims == 4  # (num_pages, page_size, kv_heads, head_dim)
@@ -1924,7 +1933,8 @@ class PersistentKernel:
                 # self.kn_graph.register_task(tb_graph, "linear_cutlass_hopper")
             else:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_hopper")
-        elif self.target_cc >= 80 and self.target_cc < 90:
+        elif (self.target_cc >= 80 and self.target_cc < 90) or self.target_cc >= 120:
+            # SM120 (consumer Blackwell): no tcgen05, use the ampere task set
             self.kn_graph.register_task(tb_graph, "linear")
         else:
             assert False, f"Unsupported compute capability: {self.target_cc}"
@@ -1963,7 +1973,8 @@ class PersistentKernel:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_with_residual_hopper", params)
             else:
                 self.kn_graph.register_task(tb_graph, "linear_swapAB_with_residual_hopper", params)
-        elif self.target_cc >= 80 and self.target_cc < 90:
+        elif (self.target_cc >= 80 and self.target_cc < 90) or self.target_cc >= 120:
+            # SM120 (consumer Blackwell): no tcgen05, use the ampere task set
             self.kn_graph.register_task(tb_graph, "linear_with_residual")
         else:
             assert False, f"Unsupported compute capability: {self.target_cc}"
